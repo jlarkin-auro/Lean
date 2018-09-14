@@ -67,8 +67,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private readonly string _agentDescription;
 
         private Thread _messageProcessingThread;
-        private readonly AutoResetEvent _resetEventRestartGateway = new AutoResetEvent(false);
-        private readonly CancellationTokenSource _ctsRestartGateway = new CancellationTokenSource();
+
+        private readonly ManualResetEvent _resetEventRestartGateway = new ManualResetEvent(false);
+        private readonly ManualResetEvent _resetEventConnection = new ManualResetEvent(false);
+        private CancellationTokenSource _ctsConnection = new CancellationTokenSource();
+        private Thread _connectionThread;
 
         // Notifies the thread reading information from Gateway/TWS whenever there are messages ready to be consumed
         private readonly EReaderSignal _signal = new EReaderMonitorSignal();
@@ -228,40 +231,71 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 }
                 Log.Trace("InteractiveBrokersBrokerage.HandleNextValidID(): " + e.OrderId);
             };
+        }
 
-            // handle requests to restart the IB gateway
-            new Thread(() =>
+        /// <summary>
+        /// Method used by the connection thread. Will be responsible of keeping us connected
+        /// </summary>
+        private void ConnectionLoop()
+        {
+            try
             {
-                try
+                Log.Trace("InteractiveBrokersBrokerage.ConnectionLoop(): thread started.");
+                while (!_ctsConnection.IsCancellationRequested)
                 {
-                    Log.Trace("InteractiveBrokersBrokerage.ResetHandler(): thread started.");
-
-                    while (!_ctsRestartGateway.IsCancellationRequested)
+                    var isResetTime = IsWithinScheduledServerResetTimes();
+                    if (!isResetTime) // we only want to connect when NOT in reset time
                     {
-                        if (_resetEventRestartGateway.WaitOne(1000, _ctsRestartGateway.Token))
+                        if (_resetEventRestartGateway.WaitOne(0) // restart was requested
+                            || !InteractiveBrokersGatewayRunner.IsRunning()) // IB gateway not running restart
                         {
-                            Log.Trace("InteractiveBrokersBrokerage.ResetHandler(): Reset sequence start.");
-
                             try
                             {
                                 ResetGatewayConnection();
+
+                                // Free any waiting for connection thread
+                                _resetEventConnection.Set();
+
+                                // clear restart flag
+                                _resetEventRestartGateway.Reset();
                             }
                             catch (Exception exception)
                             {
-                                Log.Error("InteractiveBrokersBrokerage.ResetHandler(): Error in ResetGatewayConnection: " + exception);
+                                Log.Error("InteractiveBrokersBrokerage.ConnectionLoop(): Error in ResetGatewayConnection: " + exception);
                             }
+                        }
+                        // if not connected, re connect
+                        else if (!IsConnected)
+                        {
+                            try
+                            {
+                                InnerConnect();
 
-                            Log.Trace($"InteractiveBrokersBrokerage.ResetHandler(): Reset sequence end. Current IsConnected state: {IsConnected}");
+                                // Free any waiting for connection thread
+                                _resetEventConnection.Set();
+                            }
+                            catch (Exception exception)
+                            {
+                                Log.Error("InteractiveBrokersBrokerage.ConnectionLoop(): Error in Connect: " + exception);
+                            }
+                        }
+                        else
+                        {
+                            // Everything connected so, just in case, free any thread waiting for connection
+                            _resetEventConnection.Set();
                         }
                     }
 
-                    Log.Trace("InteractiveBrokersBrokerage.ResetHandler(): thread ended.");
+                    // If in reset time sleep a bit more
+                    Thread.Sleep(isResetTime ? TimeSpan.FromSeconds(15) : TimeSpan.FromSeconds(5));
                 }
-                catch (Exception exception)
-                {
-                    Log.Error("InteractiveBrokersBrokerage.ResetHandler(): Error in reset handler thread: " + exception);
-                }
-            }) { IsBackground = true }.Start();
+
+                Log.Trace("InteractiveBrokersBrokerage.ConnectionLoop(): thread ended.");
+            }
+            catch (Exception exception)
+            {
+                Log.Error("InteractiveBrokersBrokerage.ConnectionLoop(): Error in reset handler thread: " + exception);
+            }
         }
 
         /// <summary>
@@ -411,13 +445,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <returns>The current holdings from the account</returns>
         public override List<Holding> GetAccountHoldings()
         {
-            CheckIbGateway();
-
-            if (!IsConnected)
-            {
-                Log.Trace("InteractiveBrokersBrokerage.GetAccountHoldings(): not connected, connecting now");
-                Connect();
-            }
+            CheckConnection();
 
             var holdings = _accountData.AccountHoldings.Select(x => ObjectActivator.Clone(x.Value)).Where(x => x.Quantity != 0).ToList();
 
@@ -454,13 +482,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <returns>The current cash balance for each currency available for trading</returns>
         public override List<Cash> GetCashBalance()
         {
-            CheckIbGateway();
-
-            if (!IsConnected)
-            {
-                Log.Trace("InteractiveBrokersBrokerage.GetCashBalance(): not connected, connecting now");
-                Connect();
-            }
+            CheckConnection();
 
             return _accountData.CashBalances.Select(x => new Cash(x.Key, x.Value, GetUsdConversion(x.Key))).ToList();
         }
@@ -521,12 +543,29 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         }
 
         /// <summary>
-        /// Connects the client to the IB gateway
+        /// Will start the connection thread, who is responsible of keeping the connection alive.
+        /// Will wait up to 10 seconds till connection is established.
         /// </summary>
         public override void Connect()
         {
+            if (_connectionThread == null || !_connectionThread.IsAlive)
+            {
+                _ctsConnection = new CancellationTokenSource();
+                // handle requests to restart the IB gateway
+                _connectionThread = new Thread(ConnectionLoop) { IsBackground = true };
+                _connectionThread.Start();
+            }
+            CheckConnection(60000); // wait a maximum of 60 seconds till connection
+        }
+
+        /// <summary>
+        /// Connects the client to the IB gateway and restores data subscriptions
+        /// </summary>
+        private void InnerConnect()
+        {
             if (IsConnected) return;
 
+            Log.Trace("InteractiveBrokersBrokerage.InnerConnect(): Starting connection sequence...");
             // we're going to receive fresh values for all account data, so we clear all
             _accountData.Clear();
 
@@ -548,7 +587,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     Log.Trace("InteractiveBrokersBrokerage.Connect(): Attempting to connect ({0}/{1}) ...", attempt, maxAttempts);
 
                     // if message processing thread is still running, wait until it terminates
-                    Disconnect();
+                    InnerDisconnect();
 
                     // There is socket exception happening when reconnecting right away. Testing showed 10 ms is enough, using 50ms to be on the safe side.
                     Thread.Sleep(50);
@@ -589,7 +628,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         Log.Trace("InteractiveBrokersBrokerage.Connect(): Operation took longer than 15 seconds.");
 
                         // no response, disconnect and retry
-                        Disconnect();
+                        InnerDisconnect();
 
                         var ibcLogContent = LoadCurrentIbControllerLogFile();
 
@@ -627,7 +666,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         {
                             Log.Trace("InteractiveBrokersBrokerage.Connect(): DownloadFinancialAdvisorAccount failed.");
 
-                            Disconnect();
+                            InnerDisconnect();
 
                             if (_accountHoldingsLastException != null)
                             {
@@ -651,7 +690,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         {
                             Log.Trace("InteractiveBrokersBrokerage.Connect(): DownloadAccount failed. Operation took longer than 15 seconds.");
 
-                            Disconnect();
+                            InnerDisconnect();
 
                             if (_accountHoldingsLastException != null)
                             {
@@ -697,6 +736,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     throw;
                 }
             }
+
+            RestoreDataSubscriptions();
         }
 
         /// <summary>
@@ -773,12 +814,21 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         }
 
         /// <summary>
-        /// Disconnects the client from the IB gateway
+        /// Disconnects the client from the IB gateway and stops the connection thread
         /// </summary>
         public override void Disconnect()
         {
-            _client.ClientSocket.eDisconnect();
+            _ctsConnection.Cancel(false);
+            _connectionThread?.Join(TimeSpan.FromSeconds(30));
+            InnerDisconnect();
+        }
 
+        /// <summary>
+        /// Disconnects the client from the IB gatewa
+        /// </summary>
+        private void InnerDisconnect()
+        {
+            _client.ClientSocket.eDisconnect();
             if (_messageProcessingThread != null)
             {
                 _signal.issueSignal();
@@ -801,8 +851,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             }
 
             _messagingRateLimiter.Dispose();
-
-            _ctsRestartGateway.Cancel(false);
         }
 
         /// <summary>
@@ -813,13 +861,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <param name="exchange">The exchange to send the order to, defaults to "Smart" to use IB's smart routing</param>
         private void IBPlaceOrder(Order order, bool needsNewId, string exchange = null)
         {
-            // connect will throw if it fails
-            Connect();
-
-            if (!IsConnected)
-            {
-                throw new InvalidOperationException("InteractiveBrokersBrokerage.IBPlaceOrder(): Unable to place order while not connected.");
-            }
+            CheckConnection();
 
             // MOO/MOC require directed option orders
             if (exchange == null &&
@@ -1291,12 +1333,13 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         public void ResetGatewayConnection()
         {
             _disconnected1100Fired = false;
+            Log.Trace("InteractiveBrokersBrokerage.ResetGatewayConnection(): Reset sequence start.");
 
             // notify the BrokerageMessageHandler before the restart, so it can stop polling
             OnMessage(BrokerageMessageEvent.Reconnected(string.Empty));
 
             Log.Trace("InteractiveBrokersBrokerage.ResetGatewayConnection(): Disconnecting...");
-            Disconnect();
+            InnerDisconnect();
 
             Log.Trace("InteractiveBrokersBrokerage.ResetGatewayConnection(): Stopping IB Gateway...");
             InteractiveBrokersGatewayRunner.Stop();
@@ -1304,15 +1347,13 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             Log.Trace("InteractiveBrokersBrokerage.ResetGatewayConnection(): Restarting IB Gateway...");
             InteractiveBrokersGatewayRunner.Restart();
 
-            Log.Trace("InteractiveBrokersBrokerage.ResetGatewayConnection(): Reconnecting...");
-            Connect();
-
-            Log.Trace("InteractiveBrokersBrokerage.ResetGatewayConnection(): Restoring data subscriptions...");
-            RestoreDataSubscriptions();
+            InnerConnect();
 
             // notify the BrokerageMessageHandler after the restart, because
             // it could have received a disconnect event during the steps above
             OnMessage(BrokerageMessageEvent.Reconnected(string.Empty));
+
+            Log.Trace("InteractiveBrokersBrokerage.ResetGatewayConnection(): Reset sequence end.");
         }
 
         /// <summary>
@@ -1320,6 +1361,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// </summary>
         private void RestoreDataSubscriptions()
         {
+            Log.Trace("InteractiveBrokersBrokerage.RestoreDataSubscriptions(): Restoring data subscriptions...");
             List<Symbol> subscribedSymbols;
             lock (_sync)
             {
@@ -1361,8 +1403,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 {
                     // if we were disconnected and we're not within the reset times, send the error event
                     OnMessage(BrokerageMessageEvent.Disconnected("Connection with Interactive Brokers lost. " +
-                                                                 "This could be because of internet connectivity issues or a log in from another location."
-                        ));
+                                                                 "This could be because of internet connectivity issues or a log in from another location."));
                 }
             }
             else
@@ -2684,8 +2725,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <returns></returns>
         public IEnumerable<Symbol> LookupSymbols(string lookupName, SecurityType securityType, string securityCurrency = null, string securityExchange = null)
         {
-            // connect will throw if it fails
-            Connect();
+            CheckConnection();
 
             // setting up exchange defaults and filters
             var exchangeSpecifier = securityType == SecurityType.Future ? securityExchange ?? "" : securityExchange ?? "Smart";
@@ -2980,17 +3020,19 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         }
 
         /// <summary>
-        /// Check if IB Gateway running, restart if not
+        /// Check if IB Gateway running and if connected, if not, will wait
         /// </summary>
-        public void CheckIbGateway()
+        public void CheckConnection(int millisecondsTimeout = Timeout.Infinite)
         {
-            Log.Trace("InteractiveBrokersBrokerage.CheckIbGateway(): start");
-            if (!InteractiveBrokersGatewayRunner.IsRunning())
+            Log.Trace("InteractiveBrokersBrokerage.CheckConnection(): start");
+            if (!InteractiveBrokersGatewayRunner.IsRunning() || !IsConnected)
             {
-                Log.Trace("InteractiveBrokersBrokerage.CheckIbGateway(): IB Gateway not running. Restarting...");
-                _resetEventRestartGateway.Set();
+                _resetEventConnection.Reset();
+                var isResetTime = IsWithinScheduledServerResetTimes();
+                Log.Error($"InteractiveBrokersBrokerage.CheckConnection(): Disconnected, will wait till connection. isResetTime: {isResetTime}");
+                _resetEventConnection.WaitOne(millisecondsTimeout, _ctsConnection.Token);
             }
-            Log.Trace("InteractiveBrokersBrokerage.CheckIbGateway(): end");
+            Log.Trace("InteractiveBrokersBrokerage.CheckConnection(): end");
         }
 
         private void CheckRateLimiting()

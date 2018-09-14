@@ -155,7 +155,7 @@ namespace QuantConnect.Tests.Brokerages.InteractiveBrokers
             Assert.IsTrue(InteractiveBrokersGatewayRunner.IsRunning());
             Assert.IsTrue(ib.IsConnected);
 
-            ib.CheckIbGateway();
+            ib.CheckConnection();
             Assert.IsTrue(ib.IsConnected);
         }
 
